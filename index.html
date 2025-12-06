@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Author Network Force Layout (D3.js)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.9.0/d3.min.js" crossorigin="anonymous"></script>
+  <style>
+    :root {
+      --bg: #0f1020;
+      --panel: #171828;
+      --text: #e6e6e6;
+      --muted: #a9a9a9;
+      --other: #A9A9A9;
+      --accent: #7aa2f7;
+      --accent2: #9ece6a;
+    }
+    body { margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; background: var(--bg); color: var(--text); }
+    header { padding: 12px 16px; border-bottom: 1px solid #22263a; display:flex; align-items:center; justify-content:space-between; }
+    header h1 { font-size: 18px; margin:0; font-weight:600; }
+    .container { display:grid; grid-template-columns: 320px 1fr; gap:12px; padding:12px; min-height: calc(100vh - 56px); }
+    .panel { background: var(--panel); border: 1px solid #22263a; border-radius:10px; padding:12px; }
+    .panel h2 { font-size:16px; margin:0 0 8px; font-weight:600; }
+    .control-group { margin-bottom: 12px; }
+    .control-group label { display:flex; justify-content:space-between; font-size:12px; color:var(--muted); margin-bottom:6px; }
+    .control-group input[type="range"] { width:100%; }
+    .legend { margin-top:12px; display:grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap:8px; font-size:12px; }
+    .legend-item { display:flex; align-items:center; gap:8px; }
+    .swatch { width:14px; height:14px; border-radius:50%; border: 1px solid #111; }
+    #chart { position:relative; }
+    svg { width:100%; height: calc(100vh - 120px); display:block; background: radial-gradient(1200px 700px at 40% 35%, #121431 0%, #0f1020 60%, #0b0c1a 100%); border-radius:10px; }
+    .link { stroke:#5a5e80; stroke-opacity:0.3; }
+    .node { stroke:#0b0c1a; stroke-width:1px; cursor:pointer; }
+    .node.dimmed { opacity:0.2; }
+    .tooltip { position:absolute; pointer-events:none; background:#0b0c1a; color:var(--text); border:1px solid #22263a; border-radius:8px; padding:10px; font-size:12px; box-shadow:0 4px 20px rgba(0,0,0,0.35); opacity:0; transform: translate(-50%, -120%); transition: opacity 120ms ease; max-width:260px; z-index:10; }
+    .tooltip .title { font-weight:600; margin-bottom:6px; color:var(--accent2); }
+    .tooltip .row { display:flex; justify-content:space-between; gap:12px; margin:2px 0; }
+    .note { font-size:12px; color:var(--muted); }
+    .status { font-size:12px; color:var(--muted); margin-top:8px; }
+    .badge { display:inline-block; padding:2px 8px; border-radius:999px; background:#20233b; border:1px solid #22263a; font-size:11px; margin-left:6px; color:var(--accent); }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Author network: Force layout (D3.js) <span class="badge">Req. 1–4</span></h1>
+    <div class="note">Ensure data_scopus.csv is next to this file. Adjust column names if needed.</div>
+  </header>
+
+  <div class="container">
+    <div class="panel">
+      <h2>Simulation controls</h2>
+
+      <div class="control-group">
+        <label><span>Many-body charge</span><span id="chargeVal">-30</span></label>
+        <input id="charge" type="range" min="-200" max="50" step="1" value="-30" />
+      </div>
+
+      <div class="control-group">
+        <label><span>Collide radius factor</span><span id="collideVal">1.2</span></label>
+        <input id="collide" type="range" min="0.8" max="2.0" step="0.05" value="1.2" />
+      </div>
+
+      <div class="control-group">
+        <label><span>Link strength</span><span id="linkStrengthVal">0.70</span></label>
+        <input id="linkStrength" type="range" min="0.1" max="1.5" step="0.05" value="0.70" />
+      </div>
+
+      <div class="status" id="status">Loading CSV…</div>
+
+      <h2>Country legend (top 10)</h2>
+      <div class="legend" id="legend"></div>
+
+      <div class="note">Hover a node to highlight same-affiliation authors. Click a node for details.</div>
+    </div>
+
+    <div class="panel" id="chart">
+      <svg></svg>
+      <div class="tooltip" id="tooltip"></div>
+    </div>
+  </div>
+
+  <script>
+    // ======== Column mapping (EDIT if your headers differ) ========
+    // Common Scopus-like headers are guessed. Change to match your CSV exactly.
+    const COLUMN_MAP = {
+      author: 'Author',            // e.g., "Authors" or "Author Name"
+      affiliation: 'Affiliation',  // e.g., "Affiliation"
+      country: 'Country',          // e.g., "Country" or "Affiliation Country"
+      year: 'Year',                // e.g., "Year" or "Publication Year"
+      pubId: 'PublicationID'       // e.g., "EID" / "DOI" / "Pub_ID"
+    };
+
+    // ======== Configuration ========
+    const SIZE = { width: 1200, height: 740 };
+    const NODE_RADIUS_RANGE = [3, 12];    // scaleSqrt range
+    const TOP_N_COUNTRIES = 10;
+    const OTHER_COLOR = '#A9A9A9';
+
+    const svg = d3.select('svg').attr('viewBox', [0, 0, SIZE.width, SIZE.height]);
+    const tooltip = d3.select('#tooltip');
+    const statusEl = d3.select('#status');
+    const legendEl = d3.select('#legend');
+
+    const chargeInput = d3.select('#charge');
+    const collideInput = d3.select('#collide');
+    const linkStrengthInput = d3.select('#linkStrength');
+
+    const chargeVal = d3.select('#chargeVal');
+    const collideVal = d3.select('#collideVal');
+    const linkStrengthVal = d3.select('#linkStrengthVal');
+
+    // ======== Load CSV and build network ========
+    d3.csv('data_scopus.csv').then(raw => {
+      statusEl.text('Parsing and building network…');
+
+      // Requirement: Exclude missing Year, Affiliation, Author
+      const rows = raw.filter(d =>
+        hasValue(d[COLUMN_MAP.year]) &&
+        hasValue(d[COLUMN_MAP.affiliation]) &&
+        hasValue(d[COLUMN_MAP.author])
+      );
+
+      // Nodes: unique authors (author+affiliation as key if unique ID not available)
+      const authorKey = d => normalize(`${d[COLUMN_MAP.author]}|${d[COLUMN_MAP.affiliation]}`);
+      const byAuthor = d3.rollup(rows, v => {
+        const sample = v[v.length - 1];
+        return {
+          id: authorKey(sample),
+          name: sample[COLUMN_MAP.author],
+          affiliation: sample[COLUMN_MAP.affiliation],
+          country: hasValue(sample[COLUMN_MAP.country]) ? sample[COLUMN_MAP.country] : 'Unknown',
+          count: v.length
+        };
+      }, authorKey);
+      const nodes = Array.from(byAuthor.values());
+
+      // Links: connect co-authors within the same publication (shared publications)
+      const byPub = d3.group(rows, d => normalize(d[COLUMN_MAP.pubId]));
+      const links = [];
+      for (const [pubId, recs] of byPub.entries()) {
+        if (!hasValue(pubId)) continue;
+        const authorsInPub = Array.from(new Set(recs.map(authorKey)));
+        for (let i = 0; i < authorsInPub.length; i++) {
+          for (let j = i + 1; j < authorsInPub.length; j++) {
+            links.push({ source: authorsInPub[i], target: authorsInPub[j], pubId });
+          }
+        }
+      }
+
+      // Degree per node (number of incident links)
+      const degreeMap = new Map();
+      for (const l of links) {
+        degreeMap.set(l.source, (degreeMap.get(l.source) || 0) + 1);
+        degreeMap.set(l.target, (degreeMap.get(l.target) || 0) + 1);
+      }
+      nodes.forEach(n => { n.degree = degreeMap.get(n.id) || 0; });
+
+      // Hue channel: top 10 countries colored, rest gray (#A9A9A9)
+      const countryCounts = d3.rollup(nodes, v => v.length, d => d.country);
+      const sortedCountries = Array.from(countryCounts.entries())
+        .sort((a, b) => d3.descending(a[1], b[1]))
+        .map(d => d[0]);
+      const topCountries = sortedCountries.slice(0, TOP_N_COUNTRIES);
+
+      const colorScale = d3.scaleOrdinal()
+        .domain(topCountries)
+        .range(d3.schemeTableau10);
+
+      // Legend
+      legendEl.html('');
+      topCountries.forEach(c => {
+        const item = legendEl.append('div').attr('class', 'legend-item');
+        item.append('div').attr('class', 'swatch').style('background', colorScale(c));
+        item.append('div').text(c);
+      });
+      const otherItem = legendEl.append('div').attr('class', 'legend-item');
+      otherItem.append('div').attr('class', 'swatch').style('background', OTHER_COLOR);
+      otherItem.append('div').text('Other');
+
+      // Node radius by degree: d3.scaleSqrt range [3,12]
+      const degExtent = d3.extent(nodes, d => d.degree);
+      const rScale = d3.scaleSqrt()
+        .domain(degExtent[0] === undefined ? [0, 0] : degExtent)
+        .range(NODE_RADIUS_RANGE);
+
+      // Forces
+      const linkForce = d3.forceLink(links)
+        .id(d => d.id)
+        .strength(+linkStrengthInput.node().value);
+
+      const simulation = d3.forceSimulation(nodes)
+        .force('link', linkForce)
+        .force('charge', d3.forceManyBody().strength(+chargeInput.node().value))
+        .force('center', d3.forceCenter(SIZE.width / 2, SIZE.height / 2))
+        .force('collide', d3.forceCollide().radius(d => rScale(d.degree) * +collideInput.node().value));
+
+      // Draw links
+      const link = svg.append('g')
+        .attr('stroke-width', 1)
+        .selectAll('line')
+        .data(links)
+        .join('line')
+        .attr('class', 'link');
+
+      // Draw nodes
+      const node = svg.append('g')
+        .selectAll('circle')
+        .data(nodes)
+        .join('circle')
+        .attr('class', 'node')
+        .attr('r', d => rScale(d.degree))
+        .attr('fill', d => topCountries.includes(d.country) ? colorScale(d.country) : OTHER_COLOR)
+        .on('mouseenter', handleMouseEnter)
+        .on('mouseleave', handleMouseLeave)
+        .on('click', handleClick)
+        .call(drag(simulation));
+
+      const label = svg.append('g')
+        .selectAll('text')
+        .data(nodes)
+        .join('text')
+        .text(d => d.name)
+        .attr('fill', '#c9cdf2')
+        .attr('font-size', '10px')
+        .attr('text-anchor', 'middle')
+        .attr('pointer-events', 'none')
+        .attr('opacity', 0.35);
+
+      simulation.on('tick', () => {
+        link
+          .attr('x1', d => d.source.x)
+          .attr('y1', d => d.source.y)
+          .attr('x2', d => d.target.x)
+          .attr('y2', d => d.target.y);
+
+        node
+          .attr('cx', d => d.x = clamp(d.x, 10, SIZE.width - 10))
+          .attr('cy', d => d.y = clamp(d.y, 10, SIZE.height - 10));
+
+        label
+          .attr('x', d => d.x)
+          .attr('y', d => d.y - (rScale(d.degree) + 6));
+      });
+
+      // UI controls: forceManyBody, forceCollide radius factor, link strength
+      chargeInput.on('input', function() {
+        const val = +this.value;
+        chargeVal.text(val);
+        simulation.force('charge', d3.forceManyBody().strength(val));
+        simulation.alpha(0.7).restart();
+      });
+
+      collideInput.on('input', function() {
+        const val = +this.value;
+        collideVal.text(val.toFixed(2));
+        simulation.force('collide', d3.forceCollide().radius(d => rScale(d.degree) * val));
+        simulation.alpha(0.7).restart();
+      });
+
+      linkStrengthInput.on('input', function() {
+        const val = +this.value;
+        linkStrengthVal.text(val.toFixed(2));
+        linkForce.strength(val);
+        simulation.alpha(0.7).restart();
+      });
+
+      statusEl.text(`Loaded ${rows.length} records, ${nodes.length} authors, ${links.length} links.`);
+
+      // ======== Interactions ========
+      function handleMouseEnter(event, d) {
+        const targetAffil = d.affiliation;
+        node.classed('dimmed', n => n.affiliation !== targetAffil);
+        label.attr('opacity', n => n.affiliation === targetAffil ? 0.85 : 0.1);
+        link.attr('stroke-opacity', l => {
+          const sAff = l.source.affiliation;
+          const tAff = l.target.affiliation;
+          return (sAff === targetAffil && tAff === targetAffil) ? 0.5 : 0.08;
+        });
+      }
+      function handleMouseLeave() {
+        node.classed('dimmed', false);
+        label.attr('opacity', 0.35);
+        link.attr('stroke-opacity', 0.3);
+        hideTooltip();
+      }
+      function handleClick(event, d) {
+        const [x, y] = d3.pointer(event, svg.node());
+        showTooltip(x, y, d);
+      }
+
+      // Tooltip
+      function showTooltip(x, y, d) {
+        tooltip
+          .style('left', `${x}px`)
+          .style('top', `${y}px`)
+          .style('opacity', 1)
+          .html(`
+            <div class="title">${escapeHtml(d.name)}</div>
+            <div class="row"><span>Affiliation</span><span>${escapeHtml(d.affiliation)}</span></div>
+            <div class="row"><span>Country</span><span>${escapeHtml(d.country)}</span></div>
+            <div class="row"><span>Degree</span><span>${d.degree}</span></div>
+            <div class="row"><span>Records</span><span>${d.count}</span></div>
+          `);
+      }
+      function hideTooltip() { tooltip.style('opacity', 0); }
+
+      // Drag behavior
+      function drag(sim) {
+        function dragstarted(event, d) {
+          if (!event.active) sim.alphaTarget(0.3).restart();
+          d.fx = d.x; d.fy = d.y;
+        }
+        function dragged(event, d) { d.fx = event.x; d.fy = event.y; }
+        function dragended(event, d) {
+          if (!event.active) sim.alphaTarget(0);
+          d.fx = null; d.fy = null;
+        }
+        return d3.drag().on('start', dragstarted).on('drag', dragged).on('end', dragended);
+      }
+
+      // Utilities
+      function hasValue(v) {
+        if (v === undefined || v === null) return false;
+        const s = String(v).trim();
+        return s.length > 0 && !['null','na','undefined'].includes(s.toLowerCase());
+      }
+      function normalize(s) { return s == null ? '' : String(s).trim(); }
+      function clamp(v, min, max) { return Math.max(min, Math.min(max, v)); }
+      function escapeHtml(str) {
+        return String(str).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+      }
+    }).catch(err => {
+      d3.select('#status').text('Error loading CSV. Ensure data_scopus.csv is present and accessible.');
+      console.error(err);
+    });
+  </script>
+</body>
+</html>
